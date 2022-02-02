@@ -87,6 +87,7 @@ class DropboxClient {
 
   static Future<DropboxToken> getAuthToken({
     required String authorizationCode,
+    required String codeVerifier,
     required String redirectUrl,
     required String clientId,
     required String clientSecret,
@@ -100,6 +101,7 @@ class DropboxClient {
 
     final body = {
       'code': authorizationCode,
+      'code_verifier': codeVerifier,
       'grant_type': 'authorization_code',
       'redirect_uri': redirectUrl,
     };
