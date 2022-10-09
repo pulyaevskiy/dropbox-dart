@@ -1,9 +1,13 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:file/file.dart';
 import 'package:http/http.dart';
+import 'package:logging/logging.dart';
 
 import 'models.dart';
+
+final Logger _l = Logger('DropboxClient');
 
 extension _MapUtils<K, V> on Map<K, V> {
   void putIfNotNull(K key, V value) {
@@ -13,7 +17,53 @@ extension _MapUtils<K, V> on Map<K, V> {
   }
 }
 
-class DropboxError {}
+class DropboxError {
+  final int statusCode;
+  final String? errorSummary;
+  final String? errorTag;
+
+  DropboxError({
+    required this.statusCode,
+    required this.errorSummary,
+    required this.errorTag,
+  });
+
+  static DropboxError fromResponse(Response response) {
+    assert(response.statusCode >= 400);
+    try {
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      return DropboxError(
+        statusCode: response.statusCode,
+        errorSummary: data['error_summary'],
+        errorTag: data['error']['.tag'],
+      );
+    } catch (error, stackTrace) {
+      _l.warning(
+          'Cannot parse error response: "${response.body}"', error, stackTrace);
+      return DropboxError(
+          statusCode: response.statusCode, errorSummary: null, errorTag: null);
+    }
+  }
+
+  static Future<DropboxError> fromStreamedResponse(
+      StreamedResponse response) async {
+    assert(response.statusCode >= 400);
+
+    final body = await response.stream.bytesToString();
+    try {
+      final data = jsonDecode(body) as Map<String, dynamic>;
+      return DropboxError(
+        statusCode: response.statusCode,
+        errorSummary: data['error_summary'],
+        errorTag: data['error']['.tag'],
+      );
+    } catch (error, stackTrace) {
+      _l.warning('Cannot parse error response: "$body"', error, stackTrace);
+      return DropboxError(
+          statusCode: response.statusCode, errorSummary: null, errorTag: null);
+    }
+  }
+}
 
 /// Your intent when writing a file to some path.
 ///
@@ -80,10 +130,15 @@ class SharedLink {
   }
 }
 
-class DropboxClient {
-  final String accessToken;
+typedef DropboxRefreshAccessTokenCallback = Future<String> Function();
 
-  DropboxClient(this.accessToken);
+class DropboxClient {
+  String get accessToken => _accessToken;
+  String _accessToken;
+  final DropboxRefreshAccessTokenCallback onRefreshAccessToken;
+
+  DropboxClient(String accessToken, this.onRefreshAccessToken)
+      : _accessToken = accessToken;
 
   static Future<DropboxToken> getAuthToken({
     required String authorizationCode,
@@ -112,8 +167,38 @@ class DropboxClient {
       body: body,
     );
 
-    if (response.statusCode != 200) {
-      throw DropboxError(); // TODO: clarify details of the error
+    if (response.statusCode >= 400) {
+      throw DropboxError.fromResponse(response);
+    }
+
+    return DropboxToken.fromMap(jsonDecode(response.body));
+  }
+
+  static Future<DropboxToken> getAccessToken({
+    required String clientId,
+    required String clientSecret,
+    required String refreshToken,
+  }) async {
+    final client = Client();
+    final credentials = base64.encode(utf8.encode('$clientId:$clientSecret'));
+    final headers = <String, String>{
+      'Authorization': 'Basic $credentials',
+      'Content-Type': 'application/x-www-form-urlencoded',
+    };
+
+    final body = {
+      'grant_type': 'refresh_token',
+      'refresh_token': refreshToken,
+    };
+
+    final response = await client.post(
+      Uri.parse('https://api.dropboxapi.com/oauth2/token'),
+      headers: headers,
+      body: body,
+    );
+
+    if (response.statusCode >= 400) {
+      throw DropboxError.fromResponse(response);
     }
 
     return DropboxToken.fromMap(jsonDecode(response.body));
@@ -121,20 +206,8 @@ class DropboxClient {
 
   /// Get information about the current user's account.
   Future<DropboxUser> getCurrentUser() async {
-    final client = Client();
-    final headers = <String, String>{
-      'Authorization': 'Bearer $accessToken',
-    };
-
-    final response = await client.post(
-        Uri.parse('https://api.dropboxapi.com/2/users/get_current_account'),
-        headers: headers);
-    if (response.statusCode != 200) {
-      // https://developers.dropbox.com/detecting-changes-guide
-      // Specifies that when cursor has expired the continue endpoint returns
-      // 409
-      throw DropboxError(); // TODO: clarify details of the error
-    }
+    final response = await _httpPost(
+        'https://api.dropboxapi.com/2/users/get_current_account');
 
     return DropboxUser.fromMap(jsonDecode(response.body));
   }
@@ -144,23 +217,14 @@ class DropboxClient {
     /// The path of the file to download.
     required String path,
   }) async {
-    final client = Client();
-    final request = StreamedRequest(
-        'POST', Uri.parse('https://content.dropboxapi.com/2/files/download'));
+    final response = await _httpSend(
+        'POST', 'https://content.dropboxapi.com/2/files/download', (request) {
+      final args = <String, dynamic>{'path': path};
+      request.headers['Dropbox-API-Arg'] = jsonEncode(args);
+    });
 
-    final args = <String, dynamic>{'path': path};
-
-    request.headers['Authorization'] = 'Bearer $accessToken';
-    request.headers['Dropbox-API-Arg'] = jsonEncode(args);
-
-    final response = await client.send(request);
     final data = response.headers['Dropbox-API-Result'] as String;
     final content = await response.stream.toBytes();
-    if (response.statusCode != 200) {
-      print(response.statusCode);
-      print(content);
-      throw DropboxError(); // TODO: clarify details of the error
-    }
 
     final metadata = FileMetadata.fromMap(jsonDecode(data));
     return DropboxFile(metadata, content);
@@ -222,49 +286,43 @@ class DropboxClient {
     /// with identical contents. The default for this field is false.
     bool strictConflict = false,
   }) async {
-    final client = Client();
-    final request = StreamedRequest(
-        'POST', Uri.parse('https://content.dropboxapi.com/2/files/upload'));
+    final response =
+        await _httpSend('POST', 'https://content.dropboxapi.com/2/files/upload',
+            (request) async {
+      final args = <String, dynamic>{
+        'path': path,
+        'mode': mode,
+      };
+      final clientModifiedAsString = clientModified?.toUtc().toIso8601String();
+      args
+        ..putIfNotNull('autorename', autorename)
+        ..putIfNotNull('client_modified', clientModifiedAsString)
+        ..putIfNotNull('mute', mute)
+        ..putIfNotNull(
+            'property_groups', null) // TODO: implement property_groups
+        ..putIfNotNull('strict_conflict', strictConflict);
 
-    final args = <String, dynamic>{
-      'path': path,
-      'mode': mode,
-    };
-    final clientModifiedAsString = clientModified?.toUtc().toIso8601String();
-    args
-      ..putIfNotNull('autorename', autorename)
-      ..putIfNotNull('client_modified', clientModifiedAsString)
-      ..putIfNotNull('mute', mute)
-      ..putIfNotNull('property_groups', null) // TODO: implement property_groups
-      ..putIfNotNull('strict_conflict', strictConflict);
+      request.headers['Dropbox-API-Arg'] = jsonEncode(args);
+      request.headers['Content-Type'] = 'application/octet-stream';
 
-    request.headers['Authorization'] = 'Bearer $accessToken';
-    request.headers['Dropbox-API-Arg'] = jsonEncode(args);
-    request.headers['Content-Type'] = 'application/octet-stream';
+      if (file != null) {
+        request.contentLength = await file.length();
 
-    if (file != null) {
-      request.contentLength = await file.length();
+        file.openRead().listen(
+              request.sink.add,
+              onDone: request.sink.close,
+              onError: request.sink.addError,
+            );
+      } else if (data != null) {
+        request.contentLength = data.length;
+        request.sink.add(data);
+        request.sink.close();
+      } else {
+        throw ArgumentError('Either file or data must be provided.');
+      }
+    });
 
-      file.openRead().listen(
-            request.sink.add,
-            onDone: request.sink.close,
-            onError: request.sink.addError,
-          );
-    } else if (data != null) {
-      request.contentLength = data.length;
-      request.sink.add(data);
-      request.sink.close();
-    } else {
-      throw ArgumentError('Either file or data must be provided.');
-    }
-
-    final response = await client.send(request);
     final body = await response.stream.bytesToString();
-    if (response.statusCode != 200) {
-      print(response.statusCode);
-      print(body);
-      throw DropboxError(); // TODO: clarify details of the error
-    }
 
     return FileMetadata.fromMap(jsonDecode(body));
   }
@@ -322,7 +380,6 @@ class DropboxClient {
     /// The default for this field is true.
     bool includeNonDownloadableFiles = true,
   }) async {
-    final client = Client();
     final args = <String, dynamic>{'path': path};
     args
       ..putIfNotNull('recursive', recursive)
@@ -336,45 +393,30 @@ class DropboxClient {
       ..putIfNotNull(
           'include_non_downloadable_files', includeNonDownloadableFiles);
 
-    final headers = <String, String>{
-      'Authorization': 'Bearer $accessToken',
-      'Content-Type': 'application/json',
-    };
+    final response = await _httpPost(
+      'https://api.dropboxapi.com/2/files/list_folder',
+      body: jsonEncode(args),
+    );
 
-    final response = await client.post(
-        Uri.parse('https://api.dropboxapi.com/2/files/list_folder'),
-        body: jsonEncode(args),
-        headers: headers);
-
-    if (response.statusCode != 200) {
-      // https://developers.dropbox.com/detecting-changes-guide
-      // Specifies that when cursor has expired the continue endpoint returns
-      // 409
-      print(response.body);
-      throw DropboxError(); // TODO: clarify details of the error
+    if (response.statusCode >= 400) {
+      throw DropboxError.fromResponse(response);
     }
 
     return ListFolderResult.fromMap(jsonDecode(response.body));
   }
 
   Future<ListFolderResult> listFolderContinue(String cursor) async {
-    final client = Client();
     final args = <String, dynamic>{'cursor': cursor};
+    final response = await _httpPost(
+      'https://api.dropboxapi.com/2/files/list_folder/continue',
+      body: jsonEncode(args),
+    );
 
-    final headers = <String, String>{
-      'Authorization': 'Bearer $accessToken',
-      'Content-Type': 'application/json',
-    };
-
-    final response = await client.post(
-        Uri.parse('https://api.dropboxapi.com/2/files/list_folder/continue'),
-        body: jsonEncode(args),
-        headers: headers);
-    if (response.statusCode != 200) {
-      // https://developers.dropbox.com/detecting-changes-guide
-      // Specifies that when cursor has expired the continue endpoint returns
-      // 409
-      throw DropboxError(); // TODO: clarify details of the error
+    // TODO: https://developers.dropbox.com/detecting-changes-guide
+    // Specifies that when cursor has expired the continue endpoint returns
+    // 409
+    if (response.statusCode >= 400) {
+      throw DropboxError.fromResponse(response);
     }
 
     return ListFolderResult.fromMap(jsonDecode(response.body));
@@ -386,25 +428,76 @@ class DropboxClient {
   /// The connection will block until there are changes available or a timeout
   /// occurs. This endpoint is useful mostly for client-side apps.
   Future<LongpollResult> listFolderLongpoll(String cursor, int timeout) async {
-    final client = Client();
     final args = <String, dynamic>{'cursor': cursor, 'timeout': timeout};
 
-    final headers = <String, String>{
-      'Authorization': 'Bearer $accessToken',
-      'Content-Type': 'application/json',
-    };
-
-    final response = await client.post(
-        Uri.parse('https://notify.dropboxapi.com/2/files/list_folder/longpoll'),
-        body: jsonEncode(args),
-        headers: headers);
-    if (response.statusCode != 200) {
-      // https://developers.dropbox.com/detecting-changes-guide
-      // Specifies that when cursor has expired the continue endpoint returns
-      // 409
-      throw DropboxError(); // TODO: clarify details of the error
-    }
+    // TODO: https://developers.dropbox.com/detecting-changes-guide
+    // Specifies that when cursor has expired the continue endpoint returns
+    // 409
+    final response = await _httpPost(
+      'https://notify.dropboxapi.com/2/files/list_folder/longpoll',
+      body: jsonEncode(args),
+    );
 
     return LongpollResult.fromMap(jsonDecode(response.body));
+  }
+
+  Future<Response> _httpPost(String url, {String? body}) async {
+    final client = Client();
+    final headers = <String, String>{'Authorization': 'Bearer $accessToken'};
+
+    if (body != null) {
+      headers['Content-Type'] = 'application/json';
+    }
+
+    final response = await client.post(
+      Uri.parse(url),
+      body: body,
+      headers: headers,
+    );
+
+    if (response.statusCode >= 200 && response.statusCode < 400) {
+      return response;
+    }
+
+    final error = DropboxError.fromResponse(response);
+    if (error.statusCode == 401 && error.errorTag == 'expired_access_token') {
+      // need to get a new accessToken and retry
+      _accessToken = await onRefreshAccessToken();
+      headers['Authorization'] = _accessToken;
+      return await client.post(
+        Uri.parse(url),
+        body: body,
+        headers: headers,
+      );
+    }
+    throw error;
+  }
+
+  Future<StreamedResponse> _httpSend(String method, String url,
+      FutureOr<void> Function(StreamedRequest request) handler) async {
+    final request = StreamedRequest(method, Uri.parse(url));
+    request.headers['Authorization'] = 'Bearer $accessToken';
+
+    await handler(request);
+
+    final client = Client();
+    final response = await client.send(request);
+
+    if (response.statusCode >= 200 && response.statusCode < 400) {
+      return response;
+    }
+
+    final error = await DropboxError.fromStreamedResponse(response);
+    if (error.statusCode == 401 && error.errorTag == 'expired_access_token') {
+      _accessToken = await onRefreshAccessToken();
+
+      final request = StreamedRequest(method, Uri.parse(url));
+      request.headers['Authorization'] = 'Bearer $accessToken';
+
+      await handler(request);
+
+      return await client.send(request);
+    }
+    throw error;
   }
 }

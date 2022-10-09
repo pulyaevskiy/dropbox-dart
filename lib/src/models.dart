@@ -11,7 +11,7 @@ class DropboxToken {
   final String tokenType;
 
   /// The permission set applied to the token.
-  final String scope;
+  final String? scope;
 
   /// If the token_access_type was set to offline when calling /oauth2/authorize,
   /// then response will include a refresh token.
@@ -33,8 +33,8 @@ class DropboxToken {
       accessToken: data['access_token'] as String,
       expiresIn: data['expires_in'] as int,
       tokenType: data['token_type'] as String,
-      scope: data['scope'] as String,
-      refreshToken: data['refresh_token'] as String,
+      scope: data['scope'] as String?,
+      refreshToken: data['refresh_token'] as String?,
     );
   }
 }

@@ -10,7 +10,7 @@ void main() {
   group('DropboxClient', () {
     test('smoke test', () async {
       final token = dotenv.env['DROPBOX_TEST_ACCESS_TOKEN'] as String;
-      final client = DropboxClient(token);
+      final client = DropboxClient(token, () => Future.value(token));
       final result = await client.listFolder(path: '');
 
       expect(result.entries, hasLength(0));
